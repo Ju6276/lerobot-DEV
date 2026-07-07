@@ -27,6 +27,7 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
@@ -39,6 +40,12 @@ from lerobot.utils.constants import (
 )
 
 from .configuration_fastwam import FastWAMConfig
+from .g1_hybrid_normalization import (
+    g1_hybrid_normalization_spec,
+    make_g1_hybrid_normalizer_step,
+    make_g1_hybrid_unnormalizer_step,
+    reconcile_fastwam_g1_processors,
+)
 
 
 @dataclass
@@ -105,23 +112,45 @@ def make_fastwam_pre_post_processors(
     # anyway) and unsafe across fine-tuning: its `resize_size` would be inherited from the base
     # checkpoint's camera geometry, not this dataset's, making the concatenation N_cameras x too wide.
 
-    input_steps = [
-        RenameObservationsProcessorStep(rename_map={}),
-        AddBatchDimensionProcessorStep(),
-        DeviceProcessorStep(device=config.device),
-        NormalizerProcessorStep(
+    normalization_step: ProcessorStep
+    unnormalization_step: ProcessorStep
+    if config.g1_hybrid_normalization:
+        g1_spec = g1_hybrid_normalization_spec(
+            proprio_dim=int(config.proprio_dim or 32),
+            action_dim=int(config.action_dim),
+            action_min_max_end=config.g1_action_min_max_end,
+        )
+        normalization_step = make_g1_hybrid_normalizer_step(
+            stats=normalization_stats,
+            spec=g1_spec,
+            device=config.device,
+        )
+        unnormalization_step = make_g1_hybrid_unnormalizer_step(
+            stats=normalization_stats,
+            spec=g1_spec,
+            device=config.device,
+        )
+    else:
+        normalization_step = NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=normalization_stats,
             device=config.device,
-        ),
-    ]
-    output_steps = [
-        UnnormalizerProcessorStep(
+        )
+        unnormalization_step = UnnormalizerProcessorStep(
             features=config.output_features,
             norm_map=config.normalization_mapping,
             stats=normalization_stats,
-        ),
+        )
+
+    input_steps = [
+        RenameObservationsProcessorStep(rename_map={}),
+        AddBatchDimensionProcessorStep(),
+        DeviceProcessorStep(device=config.device),
+        normalization_step,
+    ]
+    output_steps = [
+        unnormalization_step,
     ]
     if config.toggle_action_dimensions:
         output_steps.append(

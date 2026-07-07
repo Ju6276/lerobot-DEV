@@ -177,6 +177,13 @@ class FastWAMConfig(PreTrainedConfig):
             Cuts the AdamW optimizer footprint substantially; the video expert keeps its
             pretrained weights. (If enabled, also set `loss.lambda_video=0` to skip the
             now-gradient-free video loss compute.)
+        g1_hybrid_normalization (bool): Use G1-style mixed normalization instead of a
+            single mode for all state/action dims: ``observation.state`` and
+            ``action[0:g1_action_min_max_end]`` use min_max; ``action[g1_action_min_max_end:]``
+            uses mean_std (torso velocity/yaw channels by default).
+        g1_action_min_max_end (int): Last action dimension (exclusive) normalized with
+            min_max when ``g1_hybrid_normalization`` is enabled. Defaults to 32 for the
+            36-dim G1 whole-body action vector.
     """
 
     n_obs_steps: int = 1
@@ -209,6 +216,8 @@ class FastWAMConfig(PreTrainedConfig):
     fp32_attention: bool = True
     use_gradient_checkpointing: bool = False
     freeze_video_expert: bool = False
+    g1_hybrid_normalization: bool = False
+    g1_action_min_max_end: int = 32
     toggle_action_dimensions: list[int] = field(default_factory=list)
     video_scheduler: dict[str, float | int] = field(
         default_factory=lambda: {"train_shift": 5.0, "infer_shift": 5.0, "num_train_timesteps": 1000}
@@ -314,6 +323,11 @@ class FastWAMConfig(PreTrainedConfig):
         if self.proprio_dim is not None and OBS_STATE in dataset_features:
             new_inputs[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(self.proprio_dim,))
         self.input_features = new_inputs
+        # Dataset metadata may use dynamic vector shapes (e.g. `[-1]`). FastWAM needs
+        # concrete dims from the policy config, not the dataset placeholder.
+        self.output_features = {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,)),
+        }
         self.validate_features()
 
     def validate_features(self) -> None:
@@ -362,6 +376,14 @@ class FastWAMConfig(PreTrainedConfig):
             if state_shape != (self.proprio_dim,):
                 raise ValueError(
                     f"FastWAM state feature shape must be ({self.proprio_dim},), got {state_shape}."
+                )
+        if self.g1_hybrid_normalization:
+            if self.proprio_dim is None:
+                raise ValueError("`g1_hybrid_normalization` requires `proprio_dim` to be set.")
+            if self.g1_action_min_max_end <= 0 or self.g1_action_min_max_end >= self.action_dim:
+                raise ValueError(
+                    f"`g1_action_min_max_end` must satisfy 0 < end < action_dim, "
+                    f"got end={self.g1_action_min_max_end}, action_dim={self.action_dim}."
                 )
         height, width = self.image_size
         image_width_sum = 0

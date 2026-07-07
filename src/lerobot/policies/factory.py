@@ -349,6 +349,15 @@ def make_pre_post_processors(
                 preprocessor,
                 postprocessor,
             )
+        if isinstance(policy_cfg, FastWAMConfig):
+            from .fastwam.processor_fastwam import reconcile_fastwam_g1_processors
+
+            preprocessor, postprocessor = reconcile_fastwam_g1_processors(
+                policy_cfg,
+                preprocessor,
+                postprocessor,
+                dataset_stats=kwargs.get("dataset_stats"),
+            )
         return preprocessor, postprocessor
 
     # Create a new processor based on policy type

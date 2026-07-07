@@ -14,10 +14,11 @@
 
 from .configuration_fastwam import FastWAMConfig
 from .modeling_fastwam import FastWAMPolicy
-from .processor_fastwam import make_fastwam_pre_post_processors
+from .processor_fastwam import make_fastwam_pre_post_processors, reconcile_fastwam_g1_processors
 
 __all__ = [
     "FastWAMConfig",
     "FastWAMPolicy",
     "make_fastwam_pre_post_processors",
+    "reconcile_fastwam_g1_processors",
 ]
