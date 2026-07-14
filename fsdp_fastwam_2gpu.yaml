@@ -1,0 +1,18 @@
+# Accelerate FSDP config for FastWAM on 2 GPUs (FULL_SHARD ≈ ZeRO-3).
+# Wrap unit must be MoTLayer — FastWAM's Mixture-of-Transformers layer boundary.
+#
+# Launch (do NOT also pass --multi_gpu; that selects DDP):
+#   accelerate launch --config_file ./fsdp_fastwam_2gpu.yaml --num_processes=2 \
+#     $(which lerobot-train) ...
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+mixed_precision: bf16
+num_machines: 1
+num_processes: 2
+fsdp_config:
+  fsdp_version: 1
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: MoTLayer
+  fsdp_use_orig_params: true
+  fsdp_state_dict_type: FULL_STATE_DICT

@@ -1,12 +1,14 @@
 # FastWAM G1 全身遥操作数据集微调指南
 
-本文档面向从 GitHub 克隆本仓库后、需要在自有 G1 全身 loco-manipulation 数据集上微调 FastWAM 的开发者。内容覆盖：**环境配置 → 数据集改造 → G1 混合归一化 → 训练参数 → 启动命令 → 常见问题**。
+本文档面向从 GitHub 克隆本仓库后、需要在自有 G1 全身 loco-manipulation 数据集上微调 FastWAM 的开发者。内容覆盖：**环境配置 → 数据集改造 → G1 混合归一化 → 可训/冻结与防 OOM → 训练参数 → 启动命令 → 常见问题**。
 
 ---
 
 ## 目录
 
 1. [概述](#1-概述)
+   - [1.4 可训练 / 冻结](#14-哪些可以训练哪些冻结当前配方)
+   - [1.5 防 OOM 调整](#15-为避免-oom-做了哪些调整)
 2. [环境配置](#2-环境配置)
 3. [数据集准备与修改](#3-数据集准备与修改)
 4. [G1 混合归一化](#4-g1-混合归一化)
@@ -41,6 +43,7 @@
 | G1 混合归一化（min_max + mean_std） | `src/lerobot/policies/fastwam/g1_hybrid_normalization.py` |
 | FastWAM 配置项 `g1_hybrid_normalization` | `src/lerobot/policies/fastwam/configuration_fastwam.py` |
 | Processor 集成 | `src/lerobot/policies/fastwam/processor_fastwam.py` |
+| 双卡 FSDP 启动配置（避免 DDP OOM） | `fsdp_fastwam_2gpu.yaml` |
 
 ### 1.3 预训练权重来源
 
@@ -50,6 +53,52 @@ FastWAM 默认会加载：
 - **Wan2.2 骨干（VAE、文本编码器等）**：`Wan-AI/Wan2.2-TI2V-5B` / `Wan-AI/Wan2.2-TI2V-5B-Diffusers`
 
 首次训练需能访问 Hugging Face Hub（建议 `hf auth login`）。
+
+### 1.4 哪些可以训练、哪些冻结（当前配方）
+
+当前推荐配方与官方默认一致：**全量微调 DiT（`freeze_video_expert=false`）**。日志里约 `num_learnable_params ≈ 6.02B`。
+
+| 模块 | 规模（约） | 当前是否训练 | 说明 |
+|------|------------|--------------|------|
+| **Video Expert**（Wan Video DiT） | ~5.0B | **可训练** | MoT 视频专家；`freeze_video_expert=false`（默认） |
+| **Action Expert**（Action DiT） | ~1.0B | **可训练** | MoT 动作专家 |
+| **Proprio Encoder** | 很小 | **可训练** | 本体感觉投影 |
+| **Wan VAE** | — | **始终冻结** | 只做视频 latent 编解码；不进 `state_dict` / 不建 Adam |
+| **UMT5 Text Encoder** | — | **始终冻结** | 语言指令编码；同上 |
+| **Tokenizer** | — | **始终冻结** | 非可训网络 |
+
+可选开关（**本指南默认不开启**，会改变可训规模或训练速度）：
+
+| 开关 | 默认 | 作用 |
+|------|------|------|
+| `--policy.freeze_video_expert=true` | `false` | 冻结 Video Expert（~5B），只训 Action + Proprio；显存大降，但**不是全量微调** |
+| `--policy.use_gradient_checkpointing=true` | `false` | 用重算换显存；对最终能力基本等价，步速变慢 |
+| `--policy.loss.lambda_video=0` | `1.0` | 若已 freeze video，可关掉 video loss 省算力 |
+
+### 1.5 为避免 OOM 做了哪些调整
+
+全量微调 ~6B + Adam 在 A100 80GB 上单卡峰值约 **70–75GB**。OOM 通常不是「BS 太大」 alone，而是 **多卡启动方式错误** 或 **每卡 BS 过大**。
+
+相对早期「直接 `accelerate launch --multi_gpu`」导致的 OOM，当前文档 / 仓库做了这些约定：
+
+| 调整 | 内容 | 目的 |
+|------|------|------|
+| **禁止裸 DDP 多卡** | 不要用 `--multi_gpu`（每卡一整份模型+Adam ≈ 再叠 DDP 开销 → 易在 `optimizer.step()` OOM） | 多卡不再「复制全家桶」 |
+| **多卡改用 FSDP** | 仓库根目录增加 `fsdp_fastwam_2gpu.yaml`（`FULL_SHARD`，wrap `MoTLayer`） | 切分参数 / 梯度 / 优化器（≈ ZeRO-3） |
+| **每卡 `batch_size=1` 起步** | 全量微调推荐从 1 开始；有效 BS = `batch_size × 卡数` | 激活显存可控 |
+| **单卡直跑 `lerobot-train`** | 不套 `accelerate --mixed_precision` 强制 AMP | 与官方单卡路径一致，峰值约 70+GB 可跑通 |
+| **文档标明可选省显存手段** | 仍紧再开 `use_gradient_checkpointing`；或改配方 `freeze_video_expert` | 按需降显存，不改变默认全量目标 |
+
+**经验结论（A100 80GB）：**
+
+| 启动方式 | BS（每卡） | 结果 |
+|----------|------------|------|
+| 单卡 `lerobot-train` | 1 | **可训**（峰值 ~70–75GB） |
+| 双卡 **FSDP**（`fsdp_fastwam_2gpu.yaml`） | 1 | **可训**；`nvidia-smi` 每卡仍可能很高（激活 + all-gather + FSDP upcast），不要指望显存腰斩 |
+| 双卡 **DDP**（`--multi_gpu`） | 1 | **易 OOM**（不切分 + 额外开销） |
+| 任意方式硬加大每卡 BS（如 8）再全量训 | ≥4–8 | **极易顶满 / OOM**；应用卡数抬有效 BS，或先开 checkpointing |
+
+未改代码默认：`freeze_video_expert` 仍为 `false`（全量可训）。防 OOM 主要靠 **启动方式 + BS**，不是默认冻结 Video Expert。
 
 ---
 
@@ -339,8 +388,8 @@ uv run --extra test pytest tests/policies/fastwam/test_g1_hybrid_normalization.p
 | `--policy.action_horizon` | `32` | 一次预测的动作步数（训练监督长度） |
 | `--policy.n_action_steps` | `10` | **仅推理**：每次开环执行步数，须 ≤ horizon |
 | `--policy.image_size` | `'[224,448]'` | `(高, 宽)`，**非正方形**；单相机 resize 到 224×448 |
-| `--policy.freeze_video_expert` | `true` | 冻结 ~5B 视频专家，只训动作专家 + proprio 编码器 |
-| `--policy.use_gradient_checkpointing` | `true` | 用计算换显存 |
+| `--policy.use_gradient_checkpointing` | 默认 `false`（不写） | OOM / 想加大每卡 BS 时再设 `true`（换算力换显存） |
+| `--policy.freeze_video_expert` | 默认 `false`（不写） | 当前全量微调保持 false；仅当必须大幅降显存时才设 `true` |
 | `--policy.torch_dtype` | `bfloat16` | 模型精度 |
 | `--policy.device` | `cuda` | 设备 |
 | `--policy.push_to_hub` | `false` | 本地微调设 false，避免要求 `policy.repo_id` |
@@ -354,12 +403,15 @@ uv run --extra test pytest tests/policies/fastwam/test_g1_hybrid_normalization.p
 
 | 参数 | 推荐 | 说明 |
 |------|------|------|
-| `--batch_size` | `1`～`8` | **每卡** batch；双卡有效 batch = `batch_size × 2` |
+| `--batch_size` | **`1`（全量微调起步）** | **每卡** batch；有效 BS = `batch_size × num_processes`。A100 80GB 全量训勿一上来开大每卡 BS |
 | `--steps` | `100000` | 优化器更新步数 |
 | `--output_dir` | `./outputs/...` | checkpoint 与日志目录 |
 | `--save_freq` | `20000`（默认） | 每 N 步存 checkpoint |
+| `--job_name` | 自定义 | 运行名；W&B / 日志标识 |
 
 学习率默认 `1e-4`（AdamW），来自 `FastWAMConfig.optimizer_lr`。多卡时 LeRobot **不会**自动缩放学习率，需自行按有效 batch 调整。
+
+**想加大有效 BS 时的优先级：** ① 增加 FSDP 卡数（每卡仍 BS=1）→ ② 开 `use_gradient_checkpointing` 后再试每卡 BS=2 → ③ 最后才考虑 `freeze_video_expert`（改配方）。
 
 ### 5.4 图像尺寸说明
 
@@ -381,9 +433,9 @@ uv run --extra test pytest tests/policies/fastwam/test_g1_hybrid_normalization.p
     ↓
 修正 info.json shape → 验证 LeRobotDataset 可加载
     ↓
-5 step dry-run（单卡）→ 确认无 OOM / 无报错
+5 step dry-run（单卡）→ 确认无 OOM / 无报错 / loss 正常
     ↓
-正式训练（单卡或多卡 accelerate launch）
+正式训练：单卡 `lerobot-train`，或多卡 FSDP（见 §7；勿用 `--multi_gpu`）
     ↓
 outputs/ 下 checkpoint → lerobot-eval / 真机部署
 ```
@@ -405,8 +457,6 @@ lerobot-train \
   --policy.n_action_steps=10 \
   --policy.g1_hybrid_normalization=true \
   --policy.image_size='[224,448]' \
-  --policy.freeze_video_expert=true \
-  --policy.use_gradient_checkpointing=true \
   --policy.torch_dtype=bfloat16 \
   --policy.device=cuda \
   --policy.push_to_hub=false \
@@ -414,6 +464,8 @@ lerobot-train \
   --steps=5 \
   --output_dir=./outputs/fastwam_g1_dryrun
 ```
+
+期望日志含：`num_learnable_params=6020868324 (6B)`、`freeze_video_expert: False`，且若干 step 后 **loss 为有限数值（非 nan）**。
 
 ### 6.2 释放 GPU 显存（若有残留进程）
 
@@ -427,13 +479,42 @@ kill -9 <PID>
 
 ## 7. 启动命令（最终版）
 
-### 7.1 双卡 A100 正式训练（当前推荐配置）
+先确认已 `source .venv/bin/activate`，且 `which lerobot-train` / `which accelerate` 指向本仓库环境。  
+**当前默认是全量微调**（Video + Action + Proprio 可训；VAE / Text Encoder 冻结）。详见 [§1.4](#14-哪些可以训练哪些冻结当前配方)、[§1.5](#15-为避免-oom-做了哪些调整)。
+
+### 7.1 单卡训练（稳定基线，推荐先跑通）
+
+峰值显存约 **70–75GB**（A100 80GB）。不要用早期短暂的 ~24GB 读数当稳态。
+
+```bash
+lerobot-train \
+  --dataset.repo_id=local/G1WholebodyLocomotionPickBetweenTablesTeleop-v0 \
+  --dataset.root=./dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0 \
+  --dataset.use_imagenet_stats=false \
+  --policy.type=fastwam \
+  --policy.action_dim=36 \
+  --policy.proprio_dim=32 \
+  --policy.action_horizon=32 \
+  --policy.n_action_steps=10 \
+  --policy.g1_hybrid_normalization=true \
+  --policy.image_size='[224,448]' \
+  --policy.torch_dtype=bfloat16 \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --job_name=fastwam_g1_single \
+  --batch_size=1 \
+  --steps=100000 \
+  --output_dir=./outputs/fastwam_g1_single
+```
+
+### 7.2 双卡 A100 正式训练（FSDP，多卡推荐）
+
+不要用 `accelerate launch --multi_gpu`（**DDP**，易 OOM）。使用仓库根目录 **`fsdp_fastwam_2gpu.yaml`**。
 
 ```bash
 accelerate launch \
-  --multi_gpu \
+  --config_file ./fsdp_fastwam_2gpu.yaml \
   --num_processes=2 \
-  --mixed_precision=bf16 \
   $(which lerobot-train) \
   --dataset.repo_id=local/G1WholebodyLocomotionPickBetweenTablesTeleop-v0 \
   --dataset.root=./dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0 \
@@ -445,51 +526,74 @@ accelerate launch \
   --policy.n_action_steps=10 \
   --policy.g1_hybrid_normalization=true \
   --policy.image_size='[224,448]' \
-  --policy.freeze_video_expert=true \
-  --policy.use_gradient_checkpointing=true \
   --policy.torch_dtype=bfloat16 \
   --policy.device=cuda \
   --policy.push_to_hub=false \
-  --batch_size=8 \
+  --job_name=fastwam_g1_fsdp2 \
+  --batch_size=1 \
   --steps=100000 \
-  --output_dir=./outputs/fastwam_g1_pick_between_tables
+  --output_dir=./outputs/fastwam_g1_fsdp2
 ```
 
 **说明：**
 
-- 有效 batch size = `8 × 2 = 16`（每卡 8）  
-- 若 OOM，将 `--batch_size` 降为 `4` 或 `1`  
-- `accelerate launch` 开头的 warning（`num_machines`、`dynamo_backend`）可忽略  
-
-### 7.2 单卡训练
-
-将上面命令中的 `accelerate launch ... $(which lerobot-train)` 替换为直接调用：
-
-```bash
-lerobot-train \
-  ...同上参数...
-```
+| 项 | 内容 |
+|----|------|
+| 有效 BS | `1 × 2 = 2` |
+| 切分单元 | `MoTLayer`（见 yaml） |
+| 显存观感 | 每卡 `nvidia-smi` 仍可能 ~70GB+（激活 + all-gather + FSDP 将权重 upcast 到 fp32）；**验收看能否稳定 step，不要用「显存腰斩」** |
+| 勿加 | `--multi_gpu` |
+| 仍紧时 | 加 `--policy.use_gradient_checkpointing=true` |
+| 可忽略 | Accelerate 关于 `num_machines` / `dynamo_backend` 的 warning；以及 FSDP upcast warning |
 
 ### 7.3 后台运行并写日志
 
 ```bash
 nohup accelerate launch \
-  --multi_gpu \
+  --config_file ./fsdp_fastwam_2gpu.yaml \
   --num_processes=2 \
-  --mixed_precision=bf16 \
   $(which lerobot-train) \
-  ...参数... \
-  > train_fastwam_g1.log 2>&1 &
+  --dataset.repo_id=local/G1WholebodyLocomotionPickBetweenTablesTeleop-v0 \
+  --dataset.root=./dataset/G1WholebodyLocomotionPickBetweenTablesTeleop-v0 \
+  --dataset.use_imagenet_stats=false \
+  --policy.type=fastwam \
+  --policy.action_dim=36 \
+  --policy.proprio_dim=32 \
+  --policy.action_horizon=32 \
+  --policy.n_action_steps=10 \
+  --policy.g1_hybrid_normalization=true \
+  --policy.image_size='[224,448]' \
+  --policy.torch_dtype=bfloat16 \
+  --policy.device=cuda \
+  --policy.push_to_hub=false \
+  --job_name=fastwam_g1_fsdp2 \
+  --batch_size=1 \
+  --steps=100000 \
+  --output_dir=./outputs/fastwam_g1_fsdp2 \
+  > train_fastwam_g1_fsdp2.log 2>&1 &
 
-tail -f train_fastwam_g1.log
+tail -f train_fastwam_g1_fsdp2.log
 ```
 
 ### 7.4 可选：W&B 日志
+
+在上述命令中追加：
 
 ```bash
   --wandb.enable=true \
   --wandb.project=fastwam-g1 \
   --job_name=g1_pick_between_tables
+```
+
+### 7.5 可选：进一步省显存（改变度或配方）
+
+```bash
+# A. 不改配方，只砍激活（推荐先试）
+  --policy.use_gradient_checkpointing=true
+
+# B. 改配方：冻结 Video Expert（~5B 不再进 Adam；需接受非全量微调）
+  --policy.freeze_video_expert=true \
+  --policy.loss.lambda_video=0
 ```
 
 ---
@@ -499,7 +603,7 @@ tail -f train_fastwam_g1.log
 训练产物位于 `--output_dir`，例如：
 
 ```
-outputs/fastwam_g1_pick_between_tables/
+outputs/fastwam_g1_fsdp2/
 ├── checkpoints/
 │   └── last/
 │       ├── pretrained_model/
@@ -516,12 +620,15 @@ outputs/fastwam_g1_pick_between_tables/
 
 ## 9. 常见问题排查
 
-| 报错 | 原因 | 解决 |
+| 报错 / 现象 | 原因 | 解决 |
 |------|------|------|
 | `'repo_id' argument missing` | 默认 `push_to_hub=true` | `--policy.push_to_hub=false` |
 | `KeyError: 'observation.images.egocentric'` | `use_imagenet_stats` 写入不存在的图像 stats | `--dataset.use_imagenet_stats=false` |
 | `action feature shape must be (36,), got (-1,)` | `info.json` 中 action shape 为 `[-1]` | 改为 `[36]`，或使用本仓库最新 `FastWAMConfig.set_dataset_feature_metadata` |
-| CUDA OOM | batch 过大或视频+Wan 显存高 | 降低 `batch_size`；保持 `freeze_video_expert=true` |
+| 单卡 OK、多卡 BS=1 仍 OOM（`optimizer.step`） | 用了 DDP `--multi_gpu`，每卡整份模型+Adam | 改用 §7.2 FSDP；勿 `--multi_gpu` |
+| FSDP 两卡 `nvidia-smi` 仍 ~75GB | 激活不切分 + all-gather + FSDP upcast | 正常现象；要降显存再开 checkpointing / 加卡 / freeze video |
+| CUDA OOM（全量微调） | 每卡 BS 过大或 DDP | 降到 `--batch_size=1`；多卡用 FSDP；仍不够加 `--policy.use_gradient_checkpointing=true`；再不够才 `freeze_video_expert=true` |
+| `loss:nan` / `grdn:nan` | 数值不稳定（与显存无关） | 先确认归一化与数据；尝试更小 LR / 确认未异常加大 BS；从单卡 BS=1 dry-run 对照 |
 | `action_horizon=30` 校验失败 | horizon 须为 8 的倍数 | 使用 24 或 32 |
 | Hub 下载慢 | 网络 | `hf auth login`；配置镜像或预下载权重 |
 | GPU 显存未释放 | 遗留训练进程 | `nvidia-smi` + `kill -9 <pid>` |
@@ -533,12 +640,13 @@ outputs/fastwam_g1_pick_between_tables/
 | 文件 | 用途 |
 |------|------|
 | `FASTWAM_G1_FINETUNE_GUIDE.md` | 本文档 |
+| `fsdp_fastwam_2gpu.yaml` | 双卡 FastWAM FSDP Accelerate 配置（防 DDP OOM） |
 | `rename_states_to_observation_state.py` | 数据集 `states` → `observation.state` |
 | `src/lerobot/policies/fastwam/g1_hybrid_normalization.py` | G1 混合归一化实现 |
 | `src/lerobot/policies/fastwam/configuration_fastwam.py` | FastWAM + G1 配置项 |
 | `src/lerobot/policies/fastwam/processor_fastwam.py` | Pre/post processor 工厂 |
 | `docs/source/fastwam.mdx` | 上游 FastWAM 通用文档 |
-| `docs/source/multi_gpu_training.mdx` | 多卡训练说明 |
+| `docs/source/multi_gpu_training.mdx` | 多卡 / FSDP 通用说明 |
 | `tests/policies/fastwam/test_g1_hybrid_normalization.py` | 归一化单元测试 |
 
 ---
@@ -550,7 +658,9 @@ outputs/fastwam_g1_pick_between_tables/
 - [ ] 已运行 `rename_states_to_observation_state.py`（若原为 `states`）  
 - [ ] `info.json` 中 `action` shape=`[36]`，`observation.state` shape=`[32]`  
 - [ ] `stats.json` 含 `observation.state` 与 `action` 的 min/max/mean/std  
-- [ ] `lerobot-train` dry-run 5 steps 通过  
+- [ ] `lerobot-train` dry-run 5 steps 通过，且 loss 非 nan  
 - [ ] 正式训练命令含 `g1_hybrid_normalization=true` 与 `use_imagenet_stats=false`  
+- [ ] 多卡使用 `fsdp_fastwam_2gpu.yaml`，**未**使用 `--multi_gpu`  
+- [ ] 已阅读 §1.4（可训/冻结）与 §1.5（防 OOM）  
 
 如有问题，请先跑 dry-run 并对照 [第 9 节](#9-常见问题排查)。
