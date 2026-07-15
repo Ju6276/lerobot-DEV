@@ -532,6 +532,7 @@ accelerate launch \
   --job_name=fastwam_g1_fsdp2 \
   --batch_size=1 \
   --steps=100000 \
+  --log_freq=10 \
   --output_dir=./outputs/fastwam_g1_fsdp2
 ```
 
@@ -541,6 +542,7 @@ accelerate launch \
 |----|------|
 | 有效 BS | `1 × 2 = 2` |
 | 切分单元 | `MoTLayer`（见 yaml） |
+| 精度策略 | yaml `mixed_precision: bf16`；`lerobot-train` 将 FSDP 设为 **param=bf16 / reduce=fp32 / buffer=bf16**；yaml 关闭 `fsdp_cpu_ram_efficient_loading`（冻结 UMT5/VAE 必须每卡完整加载） |
 | 显存观感 | 每卡 `nvidia-smi` 仍可能 ~70GB+（激活 + all-gather + FSDP 将权重 upcast 到 fp32）；**验收看能否稳定 step，不要用「显存腰斩」** |
 | 勿加 | `--multi_gpu` |
 | 仍紧时 | 加 `--policy.use_gradient_checkpointing=true` |
@@ -569,6 +571,7 @@ nohup accelerate launch \
   --job_name=fastwam_g1_fsdp2 \
   --batch_size=1 \
   --steps=100000 \
+  --log_freq=10 \
   --output_dir=./outputs/fastwam_g1_fsdp2 \
   > train_fastwam_g1_fsdp2.log 2>&1 &
 
@@ -628,7 +631,7 @@ outputs/fastwam_g1_fsdp2/
 | 单卡 OK、多卡 BS=1 仍 OOM（`optimizer.step`） | 用了 DDP `--multi_gpu`，每卡整份模型+Adam | 改用 §7.2 FSDP；勿 `--multi_gpu` |
 | FSDP 两卡 `nvidia-smi` 仍 ~75GB | 激活不切分 + all-gather + FSDP upcast | 正常现象；要降显存再开 checkpointing / 加卡 / freeze video |
 | CUDA OOM（全量微调） | 每卡 BS 过大或 DDP | 降到 `--batch_size=1`；多卡用 FSDP；仍不够加 `--policy.use_gradient_checkpointing=true`；再不够才 `freeze_video_expert=true` |
-| `loss:nan` / `grdn:nan` | 数值不稳定（与显存无关） | 先确认归一化与数据；尝试更小 LR / 确认未异常加大 BS；从单卡 BS=1 dry-run 对照 |
+| `loss:nan` / `grdn:nan` | (1) FSDP `cpu_ram_efficient_loading` 使非 rank0 的 UMT5 未真正加载；(2) 纯 bf16 reduce | 用本仓库 `fsdp_fastwam_2gpu.yaml`（`fsdp_cpu_ram_efficient_loading: false`）+ `lerobot-train`（`reduce_dtype=fp32`）；确认 step1 loss 有限 |
 | `action_horizon=30` 校验失败 | horizon 须为 8 的倍数 | 使用 24 或 32 |
 | Hub 下载慢 | 网络 | `hf auth login`；配置镜像或预下载权重 |
 | GPU 显存未释放 | 遗留训练进程 | `nvidia-smi` + `kill -9 <pid>` |

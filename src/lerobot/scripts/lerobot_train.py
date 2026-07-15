@@ -35,6 +35,7 @@ from torch.optim import Optimizer
 from tqdm import tqdm
 
 from lerobot.common.train_utils import (
+    configure_fsdp_bf16_with_fp32_reduce,
     gather_fsdp_state_dicts,
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -223,6 +224,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     init_logging(accelerator=accelerator)
 
+    # Before prepare(): keep FSDP compute in bf16 but reduce grads in fp32.
+    configure_fsdp_bf16_with_fp32_reduce(accelerator)
+
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
     is_main_process = accelerator.is_main_process
@@ -244,6 +248,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Use accelerator's device
     device = accelerator.device
+    # Keep policy/reward-model device in sync with this rank's Accelerate device.
+    # Otherwise `--policy.device=cuda` resolves to cuda:0 on EVERY rank and 8
+    # processes fight over GPU 0 when loading FastWAM weights (DLC OOM).
+    if cfg.policy is not None:
+        cfg.policy.device = str(device)
+    if cfg.reward_model is not None and hasattr(cfg.reward_model, "device"):
+        cfg.reward_model.device = str(device)
     if cfg.cudnn_deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False

@@ -13,11 +13,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import torch
 from huggingface_hub import HfApi, snapshot_download
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
+
+if TYPE_CHECKING:
+    from accelerate import Accelerator
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.optim import (
@@ -233,6 +239,45 @@ def load_training_state(
         scheduler = load_scheduler_state(scheduler, training_state_dir)
 
     return step, optimizer, scheduler
+
+
+def configure_fsdp_bf16_with_fp32_reduce(accelerator: "Accelerator") -> bool:
+    """Use bf16 compute under FSDP but reduce gradients in fp32.
+
+    Accelerate's default ``mixed_precision=bf16`` sets both ``param_dtype`` and
+    ``reduce_dtype`` to bf16. For large MoT/FastWAM runs that combination can make
+    multi-GPU training diverge to ``loss:nan`` / ``grdn:nan`` from step 1, while the
+    same data stays finite on a single GPU. Keeping compute in bf16 and reducing in
+    fp32 is the stable default used here.
+
+    Must be called after ``Accelerator`` is created and before ``accelerator.prepare()``.
+
+    Returns:
+        True if the FSDP mixed-precision policy was updated, else False.
+    """
+    from accelerate.utils import DistributedType
+    from torch.distributed.fsdp import MixedPrecision
+
+    if accelerator.distributed_type != DistributedType.FSDP:
+        return False
+    if accelerator.mixed_precision != "bf16":
+        return False
+
+    fsdp_plugin = accelerator.state.fsdp_plugin
+    if fsdp_plugin is None:
+        return False
+
+    fsdp_plugin.mixed_precision_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        buffer_dtype=torch.bfloat16,
+    )
+    if accelerator.is_main_process:
+        logging.info(
+            "FSDP MixedPrecision: param_dtype=bf16, reduce_dtype=fp32, buffer_dtype=bf16 "
+            "(stable multi-GPU default; avoids bf16 gradient all-reduce NaNs)."
+        )
+    return True
 
 
 def gather_fsdp_state_dicts(model, optimizer) -> tuple[dict, dict]:

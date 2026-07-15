@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import os
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +49,32 @@ logger = logging.getLogger(__name__)
 WAN_DIT_PATTERN = "diffusion_pytorch_model*.safetensors"
 WAN_T5_TOKENIZER = "google/umt5-xxl"
 WAN22_DIFFUSERS_MODEL_ID = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+
+
+@contextmanager
+def _force_full_hf_weight_load() -> Iterator[None]:
+    """Load full HF weights even under Accelerate FSDP.
+
+    When ``ACCELERATE_USE_FSDP`` and ``FSDP_CPU_RAM_EFFICIENT_LOADING`` are set,
+    Transformers' ``from_pretrained`` skips materializing weights on non-rank0
+    processes (``torch.empty_like`` placeholders) and expects FSDP
+    ``sync_module_states`` to broadcast them later. FastWAM's VAE / UMT5 are
+    intentionally *unregistered* modules, so they never sync — leaving NaN/Inf
+    on rank>0 and poisoning multi-GPU training loss from step 1.
+
+    Temporarily disabling the efficient-loading flag makes every rank load real
+    weights for these frozen components.
+    """
+    key = "FSDP_CPU_RAM_EFFICIENT_LOADING"
+    previous = os.environ.get(key)
+    os.environ[key] = "false"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 class WanTextEncoder(torch.nn.Module):
@@ -112,7 +140,10 @@ def build_wan_tokenizer(*, model_id: str = WAN_T5_TOKENIZER, tokenizer_max_len: 
 def load_pretrained_wan_vae(*, torch_dtype: torch.dtype, device: str) -> WanVideoVAE38:
     """Load real Wan2.2 VAE weights from the diffusers repo (offline base creation)."""
     require_package("diffusers", extra="fastwam")
-    vae = AutoencoderKLWan.from_pretrained(WAN22_DIFFUSERS_MODEL_ID, subfolder="vae", torch_dtype=torch_dtype)
+    with _force_full_hf_weight_load():
+        vae = AutoencoderKLWan.from_pretrained(
+            WAN22_DIFFUSERS_MODEL_ID, subfolder="vae", torch_dtype=torch_dtype
+        )
     return WanVideoVAE38(dtype=torch_dtype, device=device, pretrained=vae)
 
 
@@ -129,7 +160,8 @@ def load_pretrained_wan_text_encoder(
     embedding table is indexed by the tokenizer's vocabulary.
     """
     require_package("transformers", extra="fastwam")
-    encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder=subfolder, torch_dtype=torch_dtype)
+    with _force_full_hf_weight_load():
+        encoder = UMT5EncoderModel.from_pretrained(model_id, subfolder=subfolder, torch_dtype=torch_dtype)
     return WanTextEncoder(dtype=torch_dtype, device=device, pretrained=encoder)
 
 

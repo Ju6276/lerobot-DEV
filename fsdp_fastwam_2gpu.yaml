@@ -1,9 +1,22 @@
-# Accelerate FSDP config for FastWAM on 2 GPUs (FULL_SHARD ≈ ZeRO-3).
+# Accelerate FSDP config for FastWAM on 2+ GPUs (FULL_SHARD ≈ ZeRO-3).
 # Wrap unit must be MoTLayer — FastWAM's Mixture-of-Transformers layer boundary.
 #
 # Launch (do NOT also pass --multi_gpu; that selects DDP):
 #   accelerate launch --config_file ./fsdp_fastwam_2gpu.yaml --num_processes=2 \
 #     $(which lerobot-train) ...
+#
+# Mixed precision:
+#   `mixed_precision: bf16` enables Accelerate autocast / FSDP bf16 compute.
+#   `lerobot-train` overrides FSDP MixedPrecision to:
+#     param_dtype=bf16, reduce_dtype=fp32, buffer_dtype=bf16
+#   (see `configure_fsdp_bf16_with_fp32_reduce`).
+#
+# CPU RAM efficient loading MUST stay false for FastWAM:
+#   When true, Transformers skips materializing HF weights on non-rank0 and relies
+#   on FSDP sync_module_states. FastWAM's frozen VAE/UMT5 are unregistered modules
+#   and never sync — leaving NaN/Inf text embeddings and loss:nan from step 1.
+#   Loaders in `policies/fastwam/wan/components.py` also force a full load as a
+#   belt-and-suspenders guard.
 compute_environment: LOCAL_MACHINE
 distributed_type: FSDP
 mixed_precision: bf16
@@ -16,3 +29,5 @@ fsdp_config:
   fsdp_transformer_layer_cls_to_wrap: MoTLayer
   fsdp_use_orig_params: true
   fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_sync_module_states: true

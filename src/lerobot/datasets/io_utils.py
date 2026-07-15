@@ -64,8 +64,11 @@ def load_nested_dataset(
     pq_dir: Path, features: datasets.Features | None = None, episodes: list[int] | None = None
 ) -> Dataset:
     """Find parquet files in provided directory {pq_dir}/chunk-xxx/file-xxx.parquet
-    Convert parquet files to pyarrow memory mapped in a cache folder for efficient RAM usage
-    Concatenate all pyarrow references to return HF Dataset format
+    and return them as an HF Dataset.
+
+    Loads via PyArrow directly instead of ``Dataset.from_parquet`` so we do not
+    write HuggingFace Datasets Arrow caches under ``~/.cache`` (which often fails
+    on slim DLC containers with ``OSError: Not enough disk space``).
 
     Args:
         pq_dir: Directory containing parquet files
@@ -76,10 +79,17 @@ def load_nested_dataset(
     if len(paths) == 0:
         raise FileNotFoundError(f"Provided directory does not contain any parquet file: {pq_dir}")
 
-    with SuppressProgressBars():
-        # We use .from_parquet() memory-mapped loading for efficiency
-        filters = pa_ds.field("episode_index").isin(episodes) if episodes is not None else None
-        return Dataset.from_parquet([str(path) for path in paths], filters=filters, features=features)
+    filters = None
+    if episodes is not None:
+        filters = pa_ds.field("episode_index").isin(episodes)
+
+    # Use a memory-mapped PyArrow dataset so large episode tables stay off-heap.
+    arrow_ds = pa_ds.dataset([str(path) for path in paths], format="parquet")
+    table = arrow_ds.to_table(filter=filters)
+    hf_ds = Dataset(table)
+    if features is not None:
+        hf_ds = hf_ds.cast(features)
+    return hf_ds
 
 
 def get_parquet_num_frames(parquet_path: str | Path) -> int:
